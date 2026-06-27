@@ -1,162 +1,301 @@
 #!/usr/bin/env python3
-"""Scrape ClusterRole/Binding, ServiceAccount data
-   and aggregate it per Pod
+# Copyright 2026 nezdali
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+"""Aggregate Kubernetes RBAC permissions per Pod.
+
+For every Pod in the cluster (or a chosen namespace), figure out which
+ServiceAccount it runs as and which (Cluster)Role rules that account ends
+up with through (Cluster)RoleBindings. Print the result as text or JSON.
 """
 
+from __future__ import annotations
+
+import argparse
+import json
 import logging
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Iterable
+
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
-class GetMetadata:
-    """Get metadata via k8s api class"""
-    def __init__(self):
-        #config.load_incluster_config()
-        config.load_kube_config()
-        self.v1 = client.CoreV1Api()
-        self.v2 = client.RbacAuthorizationV1Api()
+log = logging.getLogger("rbac-aggregator")
 
-    def get_role_list(self):
-        """Get Roles list from k8s api"""
-        try:
-            thread = self.v2.list_role_for_all_namespaces(
-                watch=False, async_req=True)
-            list_roles = thread.get()
-        except ApiException as err:
-            logging.debug(f"Exception when calling CoreV1Api->get_api_group: {err}\n")
-        return list_roles
+# (namespace, name) for ServiceAccount; namespace is "" for cluster-scoped subjects.
+SaKey = tuple[str, str]
+# (kind, namespace, name) for a Role or ClusterRole. namespace is "" for ClusterRole.
+RoleKey = tuple[str, str, str]
 
-    def get_role_binding_list(self):
-        """Get Role Binding list from k8s api"""
-        try:
-            thread = self.v2.list_role_binding_for_all_namespaces(
-                watch=False, async_req=True)
-            list_role_binding = thread.get()
-        except ApiException as err:
-            logging.debug(f"Exception when calling CoreV1Api->get_api_group: {err}\n")
-        return list_role_binding
 
-    def get_cluster_role_list(self):
-        """Get Cluster roles list from k8s api"""
-        try:
-            thread = self.v2.list_cluster_role(
-                watch=False, async_req=True)
-            list_cluster_roles = thread.get()
-        except ApiException as err:
-            logging.debug(f"Exception when calling CoreV1Api->get_api_group: {err}\n")
-        return list_cluster_roles
+@dataclass(frozen=True)
+class Rule:
+    """A single RBAC PolicyRule, flattened for printing."""
 
-    def get_cluster_role_binding_list(self):
-        """Get Cluster role Binding list from k8s api"""
-        try:
-            thread = self.v2.list_cluster_role_binding(
-                watch=False, async_req=True)
-            list_cluster_role_binding = thread.get()
-        except ApiException as err:
-            logging.debug(f"Exception when calling CoreV1Api->get_api_group: {err}\n")
-        return list_cluster_role_binding
+    api_groups: tuple[str, ...]
+    resources: tuple[str, ...]
+    verbs: tuple[str, ...]
+    resource_names: tuple[str, ...] = ()
+    non_resource_urls: tuple[str, ...] = ()
 
-    def get_pods_list(self):
-        """Get Pods list from k8s api"""
-        try:
-            thread = self.v1.list_pod_for_all_namespaces(
-                watch=False, async_req=True)
-            list_pods = thread.get()
-        except ApiException as err:
-            logging.debug(f"Exception when calling CoreV1Api->get_api_group: {err}\n")
-            list_pods = {}
-        return list_pods
+    @classmethod
+    def from_api(cls, rule: client.V1PolicyRule) -> Rule:
+        return cls(
+            api_groups=tuple(rule.api_groups or ()),
+            resources=tuple(rule.resources or ()),
+            verbs=tuple(rule.verbs or ()),
+            resource_names=tuple(rule.resource_names or ()),
+            non_resource_urls=tuple(rule.non_resource_urls or ()),
+        )
 
-    def get_pod_metadata(self, list_pods):
-        """Get Pod's metadata from Pods list"""
-        pods_dict = {}
-        for i in list_pods.items:
-            service_account = i.spec.service_account
-            pod_name = i.metadata.name
-            if pod_name not in pods_dict:
-                pods_dict[pod_name] = service_account
-        return pods_dict
 
-    def get_role_binding_metadata(self):
-        """Get Role Binding metadata from k8s api"""
-        role_binding_metadata_dict = {}
-        list_role_binding = self.get_role_binding_list()
-        for i in list_role_binding.items:
-            crb_role_ref = i.role_ref
-            crb_subjects = i.subjects
-            role_binding_name = vars(crb_role_ref)
-            role_binding_name = role_binding_name['_name']
-            if crb_subjects:
-                for sa in crb_subjects:
-                    crb_service_account = vars(sa)
-                    crb_service_account_name = crb_service_account['_name']
-                    role_binding_metadata_dict[role_binding_name] = crb_service_account_name
-        return role_binding_metadata_dict
+@dataclass
+class PodInfo:
+    namespace: str
+    name: str
+    service_account: str  # name only; namespace is the pod's namespace
 
-    def get_role_metadata(self, list_pods):
-        """Aggregate data from RoleBinding and Role,
-           then compare this data with Pod's serviceAccount
-        """
-        pods_dict = self.get_pod_metadata(list_pods)
-        list_roles = self.get_role_list()
-        role_binding_metadata_dict = self.get_role_binding_metadata()
-        for role in list_roles.items:
-            role_name = role.metadata.name
-            # Check if there is a RoleBinding bind to the Role
-            for role_binding_name, crb_service_account_name in role_binding_metadata_dict.items():
-                if role_binding_name != role_name:
-                    continue
-                cr_rules = role.rules
-                for rule in cr_rules:
-                    rules = vars(rule)
-                    for pod_name, pod_service_account_name in pods_dict.items():
-                        if pod_name:
-                            if pod_service_account_name == crb_service_account_name:
-                                print(f"Pod: {pod_name}, ServiceAccount:{crb_service_account_name},Resources:{rules['_resources']},Verbs:{rules['_verbs']}")
 
-    def get_cluster_role_binding_metadata(self):
-        """Get Cluster Role Binding metadata from k8s api"""
-        cluster_role_binding_metadata_dict = {}
-        list_cluster_role_binding = self.get_cluster_role_binding_list()
-        for i in list_cluster_role_binding.items:
-            crb_role_ref = i.role_ref
-            crb_subjects = i.subjects
-            role_binding_name = vars(crb_role_ref)
-            role_binding_name = role_binding_name['_name']
-            if crb_subjects:
-                for sa in crb_subjects:
-                    crb_service_account = vars(sa)
-                    crb_service_account_name = crb_service_account['_name']
-                    cluster_role_binding_metadata_dict[role_binding_name] = crb_service_account_name
-        return cluster_role_binding_metadata_dict
+@dataclass
+class PodAccess:
+    pod: PodInfo
+    # role_kind -> role_key -> rules
+    rules_by_role: dict[RoleKey, list[Rule]] = field(default_factory=dict)
 
-    def get_cluster_role_metadata(self, list_pods):
-        """Aggregate data from ClusterRoleBinding and ClusterRole,
-           then compare this data with Pod's serviceAccount
-        """
-        pods_dict = self.get_pod_metadata(list_pods)
-        list_cluster_roles = self.get_cluster_role_list()
-        cluster_role_binding_metadata_dict = self.get_cluster_role_binding_metadata()
-        for role in list_cluster_roles.items:
-            cluster_role_name = role.metadata.name
-            # Check if there is a ClusterRoleBinding bind to the ClusterRole
-            for role_binding_name, crb_service_account_name in cluster_role_binding_metadata_dict.items():
-                if role_binding_name != cluster_role_name:
-                    continue
-                cr_rules = role.rules
-                for rule in cr_rules:
-                    rules = vars(rule)
-                    for pod_name, pod_service_account_name in pods_dict.items():
-                        if pod_name:
-                            if pod_service_account_name == crb_service_account_name:
-                                print(f"Pod: {pod_name}, ServiceAccount:{crb_service_account_name},Resources:{rules['_resources']},Verbs:{rules['_verbs']}")
 
-def main():
-    """ Main function to work with the Class"""
-    run = GetMetadata()
-    list_pods = run.get_pods_list()
-    print(f"####################### Roles and RoleBinding aggregation #######################")
-    run.get_role_metadata(list_pods)
-    print(f"####################### ClusterRoles and ClusterRoleBinding aggregation #######################")
-    run.get_cluster_role_metadata(list_pods)
+def _load_kube_config(kubeconfig: str | None, context: str | None, in_cluster: bool) -> None:
+    if in_cluster:
+        config.load_incluster_config()
+        log.debug("Loaded in-cluster config")
+        return
+    try:
+        config.load_kube_config(config_file=kubeconfig, context=context)
+        log.debug("Loaded kubeconfig%s%s",
+                 f" from {kubeconfig}" if kubeconfig else "",
+                 f" (context={context})" if context else "")
+    except config.ConfigException:
+        # Fall back to in-cluster if no kubeconfig is available.
+        config.load_incluster_config()
+        log.debug("Falling back to in-cluster config")
+
+
+class RbacAggregator:
+    """Pulls all the RBAC objects once, then answers per-pod queries in memory."""
+
+    def __init__(self, namespace: str | None = None) -> None:
+        self._core = client.CoreV1Api()
+        self._rbac = client.RbacAuthorizationV1Api()
+        self._namespace = namespace
+
+    # ---------- fetchers ----------
+
+    def _list_pods(self) -> list[client.V1Pod]:
+        if self._namespace:
+            return self._core.list_namespaced_pod(self._namespace, watch=False).items
+        return self._core.list_pod_for_all_namespaces(watch=False).items
+
+    def _list_roles(self) -> list[client.V1Role]:
+        return self._rbac.list_role_for_all_namespaces(watch=False).items
+
+    def _list_role_bindings(self) -> list[client.V1RoleBinding]:
+        return self._rbac.list_role_binding_for_all_namespaces(watch=False).items
+
+    def _list_cluster_roles(self) -> list[client.V1ClusterRole]:
+        return self._rbac.list_cluster_role(watch=False).items
+
+    def _list_cluster_role_bindings(self) -> list[client.V1ClusterRoleBinding]:
+        return self._rbac.list_cluster_role_binding(watch=False).items
+
+    # ---------- core algorithm ----------
+
+    def aggregate(self) -> list[PodAccess]:
+        pods = [
+            PodInfo(
+                namespace=p.metadata.namespace,
+                name=p.metadata.name,
+                # pre-1.25 sometimes used `service_account`; both are mirrors of the same field.
+                service_account=p.spec.service_account_name or "default",
+            )
+            for p in self._list_pods()
+        ]
+        log.info("Fetched %d pods", len(pods))
+
+        # role/clusterrole rules indexed by (kind, namespace, name)
+        rules_by_role: dict[RoleKey, list[Rule]] = {}
+        for r in self._list_roles():
+            key: RoleKey = ("Role", r.metadata.namespace, r.metadata.name)
+            rules_by_role[key] = [Rule.from_api(x) for x in (r.rules or [])]
+        for r in self._list_cluster_roles():
+            key = ("ClusterRole", "", r.metadata.name)
+            rules_by_role[key] = [Rule.from_api(x) for x in (r.rules or [])]
+        log.info("Fetched %d Roles, %d ClusterRoles",
+                 sum(1 for (k, _, _) in rules_by_role if k == "Role"),
+                 sum(1 for (k, _, _) in rules_by_role if k == "ClusterRole"))
+
+        # ServiceAccount -> list of role keys it has been bound to
+        sa_to_roles: dict[SaKey, set[RoleKey]] = defaultdict(set)
+
+        for rb in self._list_role_bindings():
+            self._index_binding(
+                binding_namespace=rb.metadata.namespace,
+                role_ref=rb.role_ref,
+                subjects=rb.subjects or [],
+                target=sa_to_roles,
+            )
+        for crb in self._list_cluster_role_bindings():
+            self._index_binding(
+                binding_namespace="",  # cluster-scoped
+                role_ref=crb.role_ref,
+                subjects=crb.subjects or [],
+                target=sa_to_roles,
+            )
+        log.info("Indexed bindings for %d distinct service accounts", len(sa_to_roles))
+
+        # join pods <- service accounts -> roles -> rules
+        results: list[PodAccess] = []
+        for pod in pods:
+            sa_key: SaKey = (pod.namespace, pod.service_account)
+            role_keys = sa_to_roles.get(sa_key, set())
+            if not role_keys:
+                continue
+            access = PodAccess(pod=pod)
+            for rk in sorted(role_keys):
+                rules = rules_by_role.get(rk)
+                if rules:
+                    access.rules_by_role[rk] = rules
+            if access.rules_by_role:
+                results.append(access)
+        return results
+
+    @staticmethod
+    def _index_binding(
+        binding_namespace: str,
+        role_ref: client.V1RoleRef,
+        subjects: Iterable[client.RbacV1Subject],
+        target: dict[SaKey, set[RoleKey]],
+    ) -> None:
+        # role_ref.kind is "Role" or "ClusterRole".
+        # For a RoleBinding, a "Role" ref is in the binding's namespace; "ClusterRole" is cluster-scoped.
+        if role_ref.kind == "Role":
+            role_key: RoleKey = ("Role", binding_namespace, role_ref.name)
+        else:
+            role_key = ("ClusterRole", "", role_ref.name)
+
+        for s in subjects:
+            if s.kind != "ServiceAccount":
+                continue
+            # Subject namespace is required for SAs in ClusterRoleBindings; for RoleBindings it
+            # defaults to the binding's namespace if omitted.
+            sa_ns = s.namespace or binding_namespace
+            target[(sa_ns, s.name)].add(role_key)
+
+
+# ---------------- output ----------------
+
+def render_text(results: list[PodAccess]) -> str:
+    lines: list[str] = []
+    for access in results:
+        p = access.pod
+        lines.append(f"Pod: {p.namespace}/{p.name}  (sa={p.service_account})")
+        for (kind, ns, name), rules in access.rules_by_role.items():
+            scope = f"{ns}/" if ns else ""
+            lines.append(f"  {kind}: {scope}{name}")
+            for r in rules:
+                ag = ",".join(r.api_groups) or "*"
+                res = ",".join(r.resources) or "-"
+                verbs = ",".join(r.verbs) or "-"
+                extras = []
+                if r.resource_names:
+                    extras.append(f"names={','.join(r.resource_names)}")
+                if r.non_resource_urls:
+                    extras.append(f"urls={','.join(r.non_resource_urls)}")
+                tail = f"  [{'; '.join(extras)}]" if extras else ""
+                lines.append(f"    apiGroups={ag}  resources={res}  verbs={verbs}{tail}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_json(results: list[PodAccess]) -> str:
+    payload = [
+        {
+            "pod": {
+                "namespace": a.pod.namespace,
+                "name": a.pod.name,
+                "serviceAccount": a.pod.service_account,
+            },
+            "roles": [
+                {
+                    "kind": kind,
+                    "namespace": ns or None,
+                    "name": name,
+                    "rules": [
+                        {
+                            "apiGroups": list(r.api_groups),
+                            "resources": list(r.resources),
+                            "verbs": list(r.verbs),
+                            "resourceNames": list(r.resource_names) or None,
+                            "nonResourceURLs": list(r.non_resource_urls) or None,
+                        }
+                        for r in rules
+                    ],
+                }
+                for (kind, ns, name), rules in a.rules_by_role.items()
+            ],
+        }
+        for a in results
+    ]
+    return json.dumps(payload, indent=2, sort_keys=False)
+
+
+# ---------------- CLI ----------------
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="sa-rbac-aggregator",
+        description="Aggregate Kubernetes RBAC permissions per Pod, "
+                    "via the ServiceAccount each Pod runs under.",
+    )
+    p.add_argument("-n", "--namespace", help="Limit to a single namespace (default: all).")
+    p.add_argument("--kubeconfig", help="Path to kubeconfig (default: $KUBECONFIG or ~/.kube/config).")
+    p.add_argument("--context", help="kubeconfig context to use.")
+    p.add_argument("--in-cluster", action="store_true",
+                   help="Use in-cluster service-account credentials.")
+    p.add_argument("-o", "--output", choices=("text", "json"), default="text",
+                   help="Output format (default: text).")
+    p.add_argument("-v", "--verbose", action="count", default=0,
+                   help="-v for INFO, -vv for DEBUG.")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    level = logging.WARNING - 10 * args.verbose
+    logging.basicConfig(level=max(level, logging.DEBUG),
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    try:
+        _load_kube_config(args.kubeconfig, args.context, args.in_cluster)
+    except (config.ConfigException, FileNotFoundError) as e:
+        log.error("Could not load Kubernetes config: %s", e)
+        return 2
+
+    aggregator = RbacAggregator(namespace=args.namespace)
+    try:
+        results = aggregator.aggregate()
+    except ApiException as e:
+        log.error("Kubernetes API error: %s", e)
+        return 1
+
+    out = render_json(results) if args.output == "json" else render_text(results)
+    sys.stdout.write(out)
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

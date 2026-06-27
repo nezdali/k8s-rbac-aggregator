@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "k8s-rbac-aggregator"
+version = "1.0.0"
+description = "Aggregate Kubernetes RBAC permissions per Pod (via ServiceAccount + RoleBindings + ClusterRoleBindings)."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [{ name = "nezdali" }]
+keywords = ["kubernetes", "rbac", "security", "audit", "k8s"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Clustering",
+  "Topic :: System :: Systems Administration",
+]
+dependencies = [
+  "kubernetes>=30.1.0",
+]
+
+[project.scripts]
+sa-rbac-aggregator = "sa_rbac_aggregator:main"
+
+[project.urls]
+Homepage = "https://github.com/nezdali/k8s-rbac-aggregator"
+Issues   = "https://github.com/nezdali/k8s-rbac-aggregator/issues"
+
+[tool.hatch.build.targets.wheel]
+# Single-file module at the repo root.
+include = ["sa_rbac_aggregator.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["sa_rbac_aggregator.py", "README.md", "LICENSE"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]  # line length already enforced by formatter
